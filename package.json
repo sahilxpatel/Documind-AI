@@ -1,0 +1,26 @@
+{
+  "name": "documind-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DocuMind AI - AI SaaS application for document management",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspaces",
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "husky": "^9.0.11",
+    "lint-staged": "^15.2.2",
+    "prettier": "^3.2.5"
+  },
+  "dependencies": {
+    "pdfkit": "^0.19.1"
+  }
+}
