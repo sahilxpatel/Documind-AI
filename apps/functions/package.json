@@ -1,36 +1,37 @@
 {
   "name": "functions",
   "version": "1.0.0",
-  "description": "",
+  "description": "DocuMind AI async document processing worker",
   "main": "dist/**/*.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
-    "build": "tsc",
+    "prisma:generate": "prisma generate",
+    "typecheck": "tsc --noEmit",
+    "build": "prisma generate && tsc",
     "watch": "tsc -w",
     "clean": "rimraf dist",
     "prestart": "npm run clean && npm run build",
-    "start": "func start",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "func start"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "devDependencies": {
-    "@azure/functions": "^4.0.0",
     "@types/node": "^24.13.3",
-    "@types/pdf-parse": "^1.1.5",
     "rimraf": "^5.0.0",
-    "tsx": "^4.23.9",
     "typescript": "^6.0.3"
   },
   "dependencies": {
     "@azure/communication-email": "^1.1.0",
-    "@azure/openai": "^1.0.0-beta.12",
+    "@azure/functions": "^4.0.0",
     "@azure/search-documents": "^13.0.0",
     "@azure/storage-blob": "^12.33.0",
-    "@prisma/client": "^7.9.1",
+    "@prisma/client": "^6.19.3",
     "openai": "^7.4.0",
     "pdf-parse": "^2.4.5",
-    "prisma": "^7.9.1"
+    "prisma": "^6.19.3"
   }
 }

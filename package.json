@@ -3,24 +3,40 @@
   "version": "1.0.0",
   "private": true,
   "description": "DocuMind AI - AI SaaS application for document management",
+  "engines": {
+    "node": ">=20.0.0 <21 || >=22.0.0"
+  },
   "workspaces": [
-    "apps/*",
-    "packages/*"
+    "apps/backend",
+    "apps/frontend",
+    "apps/functions"
   ],
   "scripts": {
-    "dev": "npm run dev --workspaces",
-    "build": "npm run build --workspaces",
-    "test": "npm run test --workspaces",
-    "lint": "eslint .",
-    "format": "prettier --write ."
+    "dev": "npm run dev --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "format": "prettier --write .",
+    "prisma:generate": "npm run prisma:generate --workspace=apps/backend && npm run prisma:generate --workspace=apps/functions",
+    "prisma:migrate": "npm run prisma:migrate --workspace=apps/backend",
+    "check:schema-drift": "node scripts/check-prisma-schema-drift.mjs",
+    "check:env": "node scripts/check-env.mjs",
+    "check:azure": "node scripts/check-azure-connectivity.mjs",
+    "check:migration": "node scripts/check-migration-safety.mjs",
+    "search:index": "node scripts/create-search-index.mjs",
+    "search:inspect": "node scripts/inspect-search-index.mjs"
   },
   "devDependencies": {
-    "eslint": "^8.57.0",
     "husky": "^9.0.11",
     "lint-staged": "^15.2.2",
     "prettier": "^3.2.5"
   },
-  "dependencies": {
-    "pdfkit": "^0.19.1"
+  "allowScripts": {
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "prisma@6.19.3": true,
+    "esbuild@0.28.1": true,
+    "protobufjs@7.6.5": true
   }
 }

@@ -1,0 +1,117 @@
+// -----------------------------------------------------------------------------
+// GENERATED COPY - DO NOT EDIT DIRECTLY.
+//
+// The canonical schema lives at apps/backend/prisma/schema.prisma.
+// This copy exists so the Functions app can produce its own self-contained
+// Prisma client inside its deployment package (Azure Functions packages are
+// isolated and cannot reach into apps/backend/node_modules).
+//
+// CI fails the build if this file drifts from the canonical schema.
+// To update: copy apps/backend/prisma/schema.prisma over this file.
+// -----------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+  // CI builds on Ubuntu and deploys to Azure App Service / Functions on Linux.
+  // Declaring the targets explicitly makes `prisma generate` download the
+  // matching query engines, instead of only the build agent's native one.
+  binaryTargets = ["native", "debian-openssl-3.0.x", "debian-openssl-1.1.x"]
+}
+
+datasource db {
+  provider = "sqlserver"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique
+  passwordHash  String
+  name          String?
+  role          String         @default("USER")
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  documents     Document[]
+  conversations Conversation[]
+  notifications Notification[]
+  auditLogs     AuditLog[]
+}
+
+model Document {
+  id            String          @id @default(uuid())
+  userId        String
+  user          User            @relation(fields: [userId], references: [id])
+  title         String
+  blobUrl       String
+  status        String          @default("UPLOADED")
+  summary       String?         @db.NVarChar(Max)
+  errorMessage  String?         @db.NVarChar(Max)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  chunks        DocumentChunk[]
+  conversations Conversation[]
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+model DocumentChunk {
+  id         String   @id @default(uuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id])
+  content    String   @db.NVarChar(Max)
+  chunkIndex Int
+  // Vector embeddings live in Azure AI Search; Azure SQL stores the raw text
+  // so chat history and citations can be rendered without a search round-trip.
+  createdAt  DateTime @default(now())
+
+  @@unique([documentId, chunkIndex])
+}
+
+model Conversation {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  documentId String
+  document   Document  @relation(fields: [documentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  messages   Message[]
+
+  @@index([userId, documentId])
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  role           String
+  content        String       @db.NVarChar(Max)
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  title     String
+  message   String
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, read])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  action    String
+  entity    String
+  entityId  String
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}

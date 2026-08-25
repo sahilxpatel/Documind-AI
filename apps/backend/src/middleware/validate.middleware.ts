@@ -1,26 +1,43 @@
-import { Request, Response, NextFunction } from 'express';
-import { ZodSchema, ZodError } from 'zod';
+import { NextFunction, Request, Response } from 'express';
+import { ZodType } from 'zod';
 
-export const validate = (schema: ZodSchema) => {
-  return async (req: Request, res: Response, next: NextFunction) => {
+/**
+ * Validates request body/query/params against a Zod schema.
+ *
+ * Parsed output replaces the raw request values so controllers receive coerced
+ * types (numbers instead of strings) and trimmed/normalised strings.
+ *
+ * Failures are passed to `next` rather than answered inline, so the single error
+ * handler in error.middleware.ts owns the response shape for every 400.
+ */
+export const validate =
+  (schema: ZodType) => async (req: Request, res: Response, next: NextFunction) => {
     try {
-      await schema.parseAsync({
+      const parsed = (await schema.parseAsync({
         body: req.body,
         query: req.query,
         params: req.params,
-      });
-      return next();
-    } catch (error) {
-      if (error instanceof ZodError) {
-        return res.status(400).json({
-          error: 'Validation failed',
-          details: (error as any).errors.map((err: any) => ({
-            field: err.path.join('.'),
-            message: err.message
-          }))
+      })) as {
+        body?: unknown;
+        query?: unknown;
+        params?: unknown;
+      };
+
+      if (parsed.body !== undefined) req.body = parsed.body;
+      // Express 5 exposes req.query via a getter, so assign defensively.
+      if (parsed.query !== undefined) {
+        Object.defineProperty(req, 'query', {
+          value: parsed.query,
+          writable: true,
+          configurable: true,
         });
       }
-      return res.status(400).json({ error: 'Validation failed' });
+      if (parsed.params !== undefined) {
+        req.params = parsed.params as Request['params'];
+      }
+
+      return next();
+    } catch (error) {
+      return next(error);
     }
   };
-};

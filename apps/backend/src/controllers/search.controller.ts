@@ -1,63 +1,47 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { prisma } from '../utils/prisma';
-import { AzureOpenAI } from "openai";
-import { SearchClient, AzureKeyCredential as SearchCredential } from "@azure/search-documents";
-
-// Lazy-init: env vars aren't available at import time (dotenv runs later in index.ts)
-let _openai: AzureOpenAI;
-let _searchClient: SearchClient<any>;
-const getOpenAI = () => _openai ??= new AzureOpenAI({ 
-  endpoint: process.env.AZURE_OPENAI_ENDPOINT || '', 
-  apiKey: process.env.AZURE_OPENAI_KEY || 'placeholder',
-  apiVersion: '2024-02-15-preview'
-});
-const getSearchClient = () => _searchClient ??= new SearchClient(process.env.AZURE_SEARCH_ENDPOINT || '', process.env.AZURE_SEARCH_INDEX || 'documents', new SearchCredential(process.env.AZURE_SEARCH_KEY || 'placeholder'));
+import { createEmbedding } from '../services/openai.service';
+import { searchChunks } from '../services/search.service';
 
 export const searchDocuments = async (req: AuthRequest, res: Response) => {
-  const query = req.query.q as string;
-  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+  const user = req.user!;
+  // Validated and coerced by validate(searchSchema).
+  const query = req.query.q as unknown as string;
+  const top = (req.query.top as unknown as number) ?? 10;
 
-  if (!query) {
-    return res.status(400).json({ error: 'Query parameter "q" is required' });
-  }
+  const vector = await createEmbedding(query);
 
-  try {
-    // 1. Generate embedding for query
-    const embeddingResponse = await getOpenAI().embeddings.create({
-      model: process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT_ID || '',
-      input: query,
-    });
-    const vector = embeddingResponse.data[0].embedding;
+  // The user filter is applied inside Azure AI Search, so results never contain
+  // another tenant's content and kNN candidates are drawn only from this user's
+  // chunks. The previous implementation searched globally and discarded
+  // unauthorised hits in Node afterwards, which pulled other tenants' text into
+  // this process and could return nothing at all when their chunks dominated
+  // the top matches.
+  const hits = await searchChunks({ query, vector, userId: user.id, top });
 
-    // 2. Perform Hybrid Search
-    const searchResults = await getSearchClient().search(query, {
-      vectorSearchOptions: {
-        queries: [
-          {
-            kind: "vector",
-            vector: vector,
-            fields: ["contentVector"],
-            kNearestNeighborsCount: 10,
-          }
-        ]
-      },
-    });
+  // Attach live titles/status from the database. Search documents can lag behind
+  // deletes and renames, so the database stays authoritative for metadata.
+  const documentIds = [...new Set(hits.map((hit) => hit.documentId))];
+  const documents = await prisma.document.findMany({
+    where: { id: { in: documentIds }, userId: user.id },
+    select: { id: true, title: true, status: true },
+  });
+  const documentsById = new Map(documents.map((doc) => [doc.id, doc]));
 
-    const results = [];
-    for await (const result of searchResults.results) {
-      results.push(result.document);
-    }
+  const results = hits
+    // Drop hits whose row is gone (deleted but not yet de-indexed).
+    .filter((hit) => documentsById.has(hit.documentId))
+    .map((hit) => ({
+      id: hit.id,
+      documentId: hit.documentId,
+      documentTitle: documentsById.get(hit.documentId)!.title,
+      chunkIndex: hit.chunkIndex,
+      content: hit.content,
+      score: hit.score,
+      // Retained so existing clients reading the raw Azure field keep working.
+      '@search.score': hit.score,
+    }));
 
-    // Filter results to only include user's documents (in a real app, you'd add userId to the search index filter)
-    const userDocs = await prisma.document.findMany({ where: { userId: req.user.id } });
-    const userDocIds = new Set(userDocs.map(d => d.id));
-
-    const filteredResults = results.filter((doc: any) => userDocIds.has(doc.documentId));
-
-    res.json({ results: filteredResults });
-  } catch (error) {
-    console.error('Search failed:', error);
-    res.status(500).json({ error: 'Search failed' });
-  }
+  res.json({ query, results });
 };

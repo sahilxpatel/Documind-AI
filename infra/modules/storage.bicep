@@ -18,12 +18,20 @@ param storageSku string = 'Standard_LRS'
 @description('Name of the Key Vault to store secrets.')
 param keyVaultName string
 
-// Ensures max length 24, lowercase, numbers/letters only, and unique to resource group
-var uniqueId = uniqueString(resourceGroup().id, appName)
-var storageName = 'st${uniqueId}'
+@description('Name of the container holding uploaded documents.')
+param containerName string = 'documents'
 
-resource storageAccount 'Microsoft.Storage/storageAccounts@2022-09-01' = {
-  name: substring(storageName, 0, 24)
+@description('Days to retain soft-deleted blobs.')
+@minValue(1)
+@maxValue(365)
+param blobRetentionDays int = 7
+
+// Storage account names are 3-24 characters, lowercase alphanumeric only.
+var uniqueId = uniqueString(resourceGroup().id, appName)
+var storageName = substring('st${uniqueId}', 0, min(length('st${uniqueId}'), 24))
+
+resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
+  name: storageName
   location: location
   tags: tags
   sku: {
@@ -33,31 +41,64 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2022-09-01' = {
   properties: {
     supportsHttpsTrafficOnly: true
     minimumTlsVersion: 'TLS1_2'
+    // Uploaded documents are user data; no anonymous access under any container.
     allowBlobPublicAccess: false
+    allowSharedKeyAccess: true
+    publicNetworkAccess: 'Enabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Allow'
+    }
+    encryption: {
+      keySource: 'Microsoft.Storage'
+      requireInfrastructureEncryption: false
+      services: {
+        blob: {
+          enabled: true
+          keyType: 'Account'
+        }
+        file: {
+          enabled: true
+          keyType: 'Account'
+        }
+      }
+    }
   }
 }
 
-resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2022-09-01' = {
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
   parent: storageAccount
   name: 'default'
+  properties: {
+    // Recovers a document deleted by an application bug or a mistaken request.
+    deleteRetentionPolicy: {
+      enabled: true
+      days: blobRetentionDays
+    }
+    containerDeleteRetentionPolicy: {
+      enabled: true
+      days: blobRetentionDays
+    }
+  }
 }
 
-resource container 'Microsoft.Storage/storageAccounts/blobServices/containers@2022-09-01' = {
+resource container 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
   parent: blobService
-  name: 'documents'
+  name: containerName
   properties: {
     publicAccess: 'None'
   }
 }
 
-// Store secret directly in Key Vault
-resource storageSecret 'Microsoft.KeyVault/vaults/secrets@2023-02-01' = {
+resource storageSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   name: '${keyVaultName}/STORAGE-CONNECTION-STRING'
   properties: {
     value: 'DefaultEndpointsProtocol=https;AccountName=${storageAccount.name};EndpointSuffix=${environment().suffixes.storage};AccountKey=${storageAccount.listKeys().keys[0].value}'
+    contentType: 'Azure Storage connection string'
   }
 }
 
 output storageAccountName string = storageAccount.name
 output storageAccountId string = storageAccount.id
+output containerName string = container.name
 output storageConnectionStringSecretUri string = storageSecret.properties.secretUri
