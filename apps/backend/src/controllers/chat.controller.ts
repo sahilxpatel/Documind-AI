@@ -1,120 +1,140 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { AppError } from '../middleware/error.middleware';
 import { prisma } from '../utils/prisma';
-import { AzureOpenAI } from "openai";
-import { SearchClient, AzureKeyCredential as SearchCredential } from "@azure/search-documents";
 import { logger } from '../utils/logger';
+import { createChatCompletion, createEmbedding } from '../services/openai.service';
+import { searchChunks } from '../services/search.service';
 
-// Lazy-init: env vars aren't available at import time (dotenv runs later in index.ts)
-let _openai: AzureOpenAI;
-let _searchClient: SearchClient<any>;
-const getOpenAI = () => _openai ??= new AzureOpenAI({ 
-  endpoint: process.env.AZURE_OPENAI_ENDPOINT || '', 
-  apiKey: process.env.AZURE_OPENAI_KEY || 'placeholder',
-  apiVersion: '2024-02-15-preview'
-});
-const getSearchClient = () => _searchClient ??= new SearchClient(process.env.AZURE_SEARCH_ENDPOINT || '', process.env.AZURE_SEARCH_INDEX || 'documents', new SearchCredential(process.env.AZURE_SEARCH_KEY || 'placeholder'));
+const MAX_CONTEXT_CHARS = 12_000;
+const HISTORY_TURNS = 6;
 
 export const chatWithDocument = async (req: AuthRequest, res: Response) => {
-  const documentId = req.params.documentId as string;
-  const { message } = req.body;
+  const user = req.user!;
+  const { documentId } = req.params as { documentId: string };
+  const { message } = req.body as { message: string };
 
-  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
-
-  try {
-    // Verify document belongs to user
-    const document = await prisma.document.findFirst({
-      where: { id: documentId, userId: req.user.id }
-    });
-
-    if (!document) return res.status(404).json({ error: 'Document not found' });
-
-    // 1. Get embedding for the user's message
-    const embeddingResponse = await getOpenAI().embeddings.create({
-      model: process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT_ID || '',
-      input: message
-    });
-    const vector = embeddingResponse.data[0].embedding;
-
-    // 2. Search for relevant chunks in Azure AI Search
-    const searchResults = await getSearchClient().search(message, {
-      vectorSearchOptions: {
-        queries: [
-          {
-            kind: "vector",
-            vector: vector,
-            fields: ["contentVector"],
-            kNearestNeighborsCount: 3,
-          }
-        ]
-      },
-      filter: `documentId eq '${documentId}'`
-    });
-
-    let contextText = '';
-    for await (const result of searchResults.results) {
-      contextText += `${result.document.content}\n\n`;
-    }
-
-    // 3. Generate response using OpenAI
-    const systemPrompt = `You are a helpful AI assistant. Answer the user's question using only the provided context from the document.
-Context:
-${contextText}`;
-
-    const chatResponse = await getOpenAI().chat.completions.create({
-      model: process.env.AZURE_OPENAI_DEPLOYMENT_ID || '',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: message }
-      ]
-    });
-
-    const aiMessage = chatResponse.choices[0].message?.content || 'Sorry, I could not generate a response.';
-
-    // 4. Save conversation history
-    let conversation = await prisma.conversation.findFirst({
-      where: { documentId, userId: req.user.id }
-    });
-
-    if (!conversation) {
-      conversation = await prisma.conversation.create({
-        data: { documentId, userId: req.user.id }
-      });
-    }
-
-    await prisma.message.create({
-      data: {
-        conversationId: conversation.id,
-        role: 'USER',
-        content: message
-      }
-    });
-
-    await prisma.message.create({
-      data: {
-        conversationId: conversation.id,
-        role: 'AI',
-        content: aiMessage
-      }
-    });
-
-    res.json({ answer: aiMessage });
-  } catch (error) {
-    logger.error('Chat error:', error);
-    res.status(500).json({ error: 'Failed to process chat message' });
-  }
-};
-
-export const getConversationHistory = async (req: AuthRequest, res: Response) => {
-  const documentId = req.params.documentId as string;
-  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
-
-  const conversation = await prisma.conversation.findFirst({
-    where: { documentId, userId: req.user.id },
-    include: {
-      messages: { orderBy: { createdAt: 'asc' } }
-    }
+  // Ownership check first: never spend an embedding call on a document the
+  // caller cannot see.
+  const document = await prisma.document.findFirst({
+    where: { id: documentId, userId: user.id },
+    select: { id: true, title: true, status: true },
   });
 
-  res.json({ messages: conversation?.messages || [] });
+  if (!document) {
+    throw new AppError(404, 'Document not found');
+  }
+  if (document.status !== 'COMPLETED') {
+    throw new AppError(
+      409,
+      `This document is still ${document.status.toLowerCase()}. Chat is available once processing completes.`,
+    );
+  }
+
+  const vector = await createEmbedding(message);
+
+  const chunks = await searchChunks({
+    query: message,
+    vector,
+    userId: user.id,
+    documentId,
+    top: 5,
+  });
+
+  if (chunks.length === 0) {
+    logger.warn('No indexed chunks matched', { documentId, userId: user.id });
+  }
+
+  // Bound the context so a long document cannot push the request past the
+  // deployment's token limit (which fails the whole call).
+  let contextText = '';
+  for (const chunk of chunks) {
+    if (contextText.length + chunk.content.length > MAX_CONTEXT_CHARS) break;
+    contextText += `${chunk.content}\n\n---\n\n`;
+  }
+
+  const conversation = await getOrCreateConversation(documentId, user.id);
+
+  const priorMessages = await prisma.message.findMany({
+    where: { conversationId: conversation.id },
+    orderBy: { createdAt: 'desc' },
+    take: HISTORY_TURNS,
+    select: { role: true, content: true },
+  });
+
+  const systemPrompt = [
+    `You are DocuMind, an assistant answering questions about the document "${document.title}".`,
+    'Answer using only the context below. If the context does not contain the answer, say so plainly rather than guessing.',
+    'Keep answers concise and cite the relevant wording from the context where useful.',
+    '',
+    'Context:',
+    contextText || '(no relevant passages were found in this document)',
+  ].join('\n');
+
+  const answer = await createChatCompletion([
+    { role: 'system', content: systemPrompt },
+    // Reversed back into chronological order for the model.
+    ...priorMessages.reverse().map((m) => ({
+      role: m.role === 'AI' ? ('assistant' as const) : ('user' as const),
+      content: m.content,
+    })),
+    { role: 'user', content: message },
+  ]);
+
+  const finalAnswer = answer || 'Sorry, I could not generate a response.';
+
+  // One transaction so a partial write cannot leave a question without its
+  // answer (or vice versa) in the history.
+  await prisma.$transaction([
+    prisma.message.create({
+      data: { conversationId: conversation.id, role: 'USER', content: message },
+    }),
+    prisma.message.create({
+      data: { conversationId: conversation.id, role: 'AI', content: finalAnswer },
+    }),
+  ]);
+
+  res.json({
+    answer: finalAnswer,
+    sources: chunks.map((chunk) => ({
+      chunkIndex: chunk.chunkIndex,
+      excerpt: chunk.content.slice(0, 300),
+    })),
+  });
+};
+
+/**
+ * Conversation has no unique constraint on (userId, documentId), so this is a
+ * find-then-create rather than an upsert. A concurrent double-create is benign:
+ * both rows are owned by the same user and document, and reads take the first.
+ */
+async function getOrCreateConversation(documentId: string, userId: string) {
+  const existing = await prisma.conversation.findFirst({
+    where: { documentId, userId },
+    select: { id: true },
+  });
+
+  if (existing) return existing;
+
+  return prisma.conversation.create({
+    data: { documentId, userId },
+    select: { id: true },
+  });
+}
+
+export const getConversationHistory = async (req: AuthRequest, res: Response) => {
+  const user = req.user!;
+  const { documentId } = req.params as { documentId: string };
+
+  const conversation = await prisma.conversation.findFirst({
+    where: { documentId, userId: user.id },
+    include: {
+      messages: {
+        orderBy: { createdAt: 'asc' },
+        select: { id: true, role: true, content: true, createdAt: true },
+      },
+    },
+  });
+
+  res.json({ messages: conversation?.messages ?? [] });
 };

@@ -1,0 +1,11 @@
+.git*
+.vscode
+.env
+local.settings.json
+tsconfig.json
+prisma.config.ts
+src
+test
+*.ts
+*.map
+.funcignore
