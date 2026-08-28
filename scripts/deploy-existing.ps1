@@ -354,6 +354,53 @@ Write-Step 'Packaging'
 if (Test-Path $stagingRoot) { Remove-Item -Recurse -Force $stagingRoot }
 New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
 
+# Strips build-time-only artifacts from a staged node_modules tree.
+#
+# `prisma generate` needs the Prisma CLI and its engine downloads, but none of it
+# is used at runtime: @prisma/client loads the query engine from
+# node_modules/.prisma/client. Left in place these add roughly 200 MB to the
+# archive, most of it Windows binaries that cannot even run on App Service.
+function Remove-BuildOnlyArtifacts {
+  param([string]$Stage)
+
+  $nm = Join-Path $Stage 'node_modules'
+  if (-not (Test-Path $nm)) { return 0 }
+
+  $before = (Get-ChildItem $nm -Recurse -File -ErrorAction SilentlyContinue |
+    Measure-Object Length -Sum).Sum
+
+  # Engine download cache, and the CLI plus its engine package.
+  foreach ($path in @('.cache', 'prisma', '@prisma/engines', 'typescript')) {
+    $target = Join-Path $nm $path
+    if (Test-Path $target) { Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue }
+  }
+
+  # The generated client ships an engine per declared binaryTarget. App Service
+  # runs Linux, so the Windows engine is dead weight. Both Debian variants are
+  # kept because the base image's OpenSSL version can differ between stamps and
+  # Prisma picks the matching one at runtime.
+  Get-ChildItem (Join-Path $nm '.prisma') -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '*windows*' } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
+  # TypeScript declarations, source maps and package docs are never read at
+  # runtime. In an SDK-heavy tree they are most of the weight: @azure,
+  # @opentelemetry and effect ship very large .d.ts files.
+  Get-ChildItem $nm -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.Name -like '*.d.ts' -or $_.Name -like '*.d.mts' -or $_.Name -like '*.d.cts' -or
+      $_.Name -like '*.map' -or
+      $_.Name -like '*.md' -or $_.Name -like '*.markdown' -or
+      $_.Name -eq 'CHANGELOG' -or $_.Name -like '*.ts.map'
+    } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+
+  $after = (Get-ChildItem $nm -Recurse -File -ErrorAction SilentlyContinue |
+    Measure-Object Length -Sum).Sum
+
+  return [math]::Round(($before - $after) / 1MB, 1)
+}
+
 function New-NodePackage {
   param(
     [string]$Name,
@@ -380,15 +427,21 @@ function New-NodePackage {
   # empty and copying it would ship an app with no dependencies.
   Push-Location $stage
   try {
-    & npm install --omit=dev --no-audit --no-fund --ignore-scripts --silent
-    if ($LASTEXITCODE -ne 0) { throw "npm install failed for $Name." }
+    # Output is captured into variables rather than left on the pipeline: anything
+    # a function writes to stdout becomes part of its return value, which would
+    # turn the returned path into an array of npm log lines.
+    $npmOut = & npm install --omit=dev --no-audit --no-fund --ignore-scripts 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "npm install failed for ${Name}:`n$npmOut" }
 
     if (Test-Path (Join-Path $stage 'prisma/schema.prisma')) {
-      & npx --yes prisma generate
-      if ($LASTEXITCODE -ne 0) { throw "prisma generate failed for $Name." }
+      $prismaOut = & npx --yes prisma generate 2>&1
+      if ($LASTEXITCODE -ne 0) { throw "prisma generate failed for ${Name}:`n$prismaOut" }
     }
   }
   finally { Pop-Location }
+
+  $saved = Remove-BuildOnlyArtifacts -Stage $stage
+  Write-Info "pruned $saved MB of build-only artifacts from $Name"
 
   return $stage
 }

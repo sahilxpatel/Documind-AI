@@ -14,6 +14,9 @@ local.settings.json
 artifacts/
 .deploy/
 
+# Portal deployment bundle - contains app settings with live secrets
+.deploy-out/
+
 # SPA bundle copied into the API package at deploy time
 apps/backend/public/
 
