@@ -129,7 +129,7 @@ function Set-AppSettings {
   $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) "documind-settings-$([guid]::NewGuid()).json"
   try {
     # -Depth 5 keeps ConvertTo-Json from truncating; -Compress avoids stray newlines.
-    ($payload | ConvertTo-Json -Depth 5 -Compress) | Set-Content -LiteralPath $tempFile -Encoding utf8 -NoNewline
+    Write-Utf8NoBom -Path $tempFile -Content ($payload | ConvertTo-Json -Depth 5 -Compress)
 
     Invoke-Az @($Kind, 'config', 'appsettings', 'set',
       '--resource-group', $ResourceGroup, '--name', $AppName,
@@ -401,10 +401,53 @@ function Remove-BuildOnlyArtifacts {
   return [math]::Round(($before - $after) / 1MB, 1)
 }
 
+# Rewrites the packaged package.json so it describes a *runtime*, not a project.
+#
+# App Service can decide to run a server-side Oryx build, and Oryx runs
+# `npm run build` whenever a build script exists. This package already contains
+# compiled output, so that build runs `tsc` with no tsconfig.json and no src/,
+# whereupon tsc prints its help text and exits 1, failing the deployment.
+#
+# Dropping the build-time scripts and devDependencies means an Oryx build has
+# nothing to do instead of something to get wrong.
+# Writes UTF-8 with no byte-order mark.
+#
+# Set-Content -Encoding utf8 emits a BOM on Windows PowerShell 5.1, and Node
+# cannot parse a package.json that starts with one: it fails with
+# "Unexpected token '\ufeff'". The Azure CLI dislikes it in @file arguments too.
+function Write-Utf8NoBom {
+  param([string]$Path, [string]$Content)
+  [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Write-RuntimePackageJson {
+  param([string]$SourceApp, [string]$Destination, [string]$StartCommand)
+
+  $pkg = Get-Content -LiteralPath (Join-Path $SourceApp 'package.json') -Raw | ConvertFrom-Json
+
+  $runtime = [ordered]@{
+    name    = $pkg.name
+    version = $pkg.version
+    private = $true
+    main    = $pkg.main
+  }
+  if ($pkg.PSObject.Properties.Name -contains 'type') { $runtime['type'] = $pkg.type }
+  if ($pkg.PSObject.Properties.Name -contains 'engines') { $runtime['engines'] = $pkg.engines }
+
+  # Only a start script survives. No build, dev, typecheck or prisma scripts.
+  if ($StartCommand) { $runtime['scripts'] = [ordered]@{ start = $StartCommand } }
+
+  # Dependencies are kept so a platform-side `npm install` resolves the same tree.
+  $runtime['dependencies'] = $pkg.dependencies
+
+  Write-Utf8NoBom -Path $Destination -Content ($runtime | ConvertTo-Json -Depth 10)
+}
+
 function New-NodePackage {
   param(
     [string]$Name,
     [string]$SourceApp,
+    [string]$StartCommand,
     [string[]]$ExtraDirs = @()
   )
 
@@ -412,7 +455,8 @@ function New-NodePackage {
   New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
   Copy-Item -Recurse -Force (Join-Path $SourceApp 'dist') (Join-Path $stage 'dist')
-  Copy-Item -Force (Join-Path $SourceApp 'package.json') (Join-Path $stage 'package.json')
+  Write-RuntimePackageJson -SourceApp $SourceApp `
+    -Destination (Join-Path $stage 'package.json') -StartCommand $StartCommand
   if (Test-Path (Join-Path $SourceApp 'prisma')) {
     Copy-Item -Recurse -Force (Join-Path $SourceApp 'prisma') (Join-Path $stage 'prisma')
   }
@@ -471,7 +515,8 @@ if (-not $WorkerOnly) {
     throw "Frontend build not found at $frontendDist. Run without -SkipBuild."
   }
 
-  $apiStage = New-NodePackage -Name 'api' -SourceApp (Join-Path $repoRoot 'apps/backend')
+  $apiStage = New-NodePackage -Name 'api' -SourceApp (Join-Path $repoRoot 'apps/backend') `
+    -StartCommand 'node dist/index.js'
 
   # The SPA travels with the API and is served from the same origin. SERVE_STATIC_DIR
   # points at this folder.
@@ -484,7 +529,10 @@ if (-not $WorkerOnly) {
 }
 
 if ($FunctionAppName -and -not $ApiOnly) {
-  $workerStage = New-NodePackage -Name 'worker' -SourceApp (Join-Path $repoRoot 'apps/functions')
+  # No start script: the Functions host loads dist/**/*.js via `main` and never
+  # runs npm start.
+  $workerStage = New-NodePackage -Name 'worker' -SourceApp (Join-Path $repoRoot 'apps/functions') `
+    -StartCommand ''
   Copy-Item -Force (Join-Path $repoRoot 'apps/functions/host.json') (Join-Path $workerStage 'host.json')
   # Needed only to generate the client, which embeds its own copy of the schema.
   Remove-Item -Recurse -Force (Join-Path $workerStage 'prisma') -ErrorAction SilentlyContinue

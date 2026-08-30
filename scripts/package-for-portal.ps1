@@ -84,7 +84,7 @@ function Write-SettingsFile {
   foreach ($k in $Settings.Keys) {
     $payload += [ordered]@{ name = $k; value = [string]$Settings[$k]; slotSetting = $false }
   }
-  ($payload | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $Path -Encoding utf8
+  Write-Utf8NoBom -Path $Path -Content ($payload | ConvertTo-Json -Depth 5)
 }
 
 function New-Zip {
@@ -149,14 +149,57 @@ function Remove-BuildOnlyArtifacts {
   return [math]::Round(($before - $after) / 1MB, 1)
 }
 
+# Rewrites the packaged package.json so it describes a *runtime*, not a project.
+#
+# App Service can decide to run a server-side Oryx build, and Oryx runs
+# `npm run build` whenever a build script exists. This package already contains
+# compiled output, so that build runs `tsc` with no tsconfig.json and no src/,
+# whereupon tsc prints its help text and exits 1, failing the deployment.
+#
+# Dropping the build-time scripts and devDependencies means an Oryx build has
+# nothing to do instead of something to get wrong.
+# Writes UTF-8 with no byte-order mark.
+#
+# Set-Content -Encoding utf8 emits a BOM on Windows PowerShell 5.1, and Node
+# cannot parse a package.json that starts with one: it fails with
+# "Unexpected token '\ufeff'". The Azure Portal's settings editor dislikes it too.
+function Write-Utf8NoBom {
+  param([string]$Path, [string]$Content)
+  [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Write-RuntimePackageJson {
+  param([string]$SourceApp, [string]$Destination, [string]$StartCommand)
+
+  $pkg = Get-Content -LiteralPath (Join-Path $SourceApp 'package.json') -Raw | ConvertFrom-Json
+
+  $runtime = [ordered]@{
+    name    = $pkg.name
+    version = $pkg.version
+    private = $true
+    main    = $pkg.main
+  }
+  if ($pkg.PSObject.Properties.Name -contains 'type') { $runtime['type'] = $pkg.type }
+  if ($pkg.PSObject.Properties.Name -contains 'engines') { $runtime['engines'] = $pkg.engines }
+
+  # Only a start script survives. No build, dev, typecheck or prisma scripts.
+  if ($StartCommand) { $runtime['scripts'] = [ordered]@{ start = $StartCommand } }
+
+  # Dependencies are kept so a platform-side `npm install` resolves the same tree.
+  $runtime['dependencies'] = $pkg.dependencies
+
+  Write-Utf8NoBom -Path $Destination -Content ($runtime | ConvertTo-Json -Depth 10)
+}
+
 function New-NodePackage {
-  param([string]$Name, [string]$SourceApp)
+  param([string]$Name, [string]$SourceApp, [string]$StartCommand)
 
   $stage = Join-Path $stagingRoot $Name
   New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
   Copy-Item -Recurse -Force (Join-Path $SourceApp 'dist') (Join-Path $stage 'dist')
-  Copy-Item -Force (Join-Path $SourceApp 'package.json') (Join-Path $stage 'package.json')
+  Write-RuntimePackageJson -SourceApp $SourceApp `
+    -Destination (Join-Path $stage 'package.json') -StartCommand $StartCommand
   if (Test-Path (Join-Path $SourceApp 'prisma')) {
     Copy-Item -Recurse -Force (Join-Path $SourceApp 'prisma') (Join-Path $stage 'prisma')
   }
@@ -279,7 +322,8 @@ if (-not (Test-Path (Join-Path $frontendDist 'index.html'))) {
   throw "Frontend build not found at $frontendDist. Run without -SkipBuild."
 }
 
-$apiStage = New-NodePackage -Name 'api' -SourceApp (Join-Path $repoRoot 'apps/backend')
+$apiStage = New-NodePackage -Name 'api' -SourceApp (Join-Path $repoRoot 'apps/backend') `
+  -StartCommand 'node dist/index.js'
 $publicDir = Join-Path $apiStage 'public'
 New-Item -ItemType Directory -Path $publicDir -Force | Out-Null
 Copy-Item -Recurse -Force (Join-Path $frontendDist '*') $publicDir
@@ -290,7 +334,10 @@ Write-Ok ("api.zip    {0:N1} MB" -f ((Get-Item $apiZip).Length / 1MB))
 
 $workerZip = $null
 if ($workerSettings.Count -gt 0) {
-  $workerStage = New-NodePackage -Name 'worker' -SourceApp (Join-Path $repoRoot 'apps/functions')
+  # No start script: the Functions host loads dist/**/*.js via `main` and never
+  # runs npm start.
+  $workerStage = New-NodePackage -Name 'worker' -SourceApp (Join-Path $repoRoot 'apps/functions') `
+    -StartCommand ''
   Copy-Item -Force (Join-Path $repoRoot 'apps/functions/host.json') (Join-Path $workerStage 'host.json')
   # Only needed to generate the client, which embeds its own copy of the schema.
   Remove-Item -Recurse -Force (Join-Path $workerStage 'prisma') -ErrorAction SilentlyContinue
@@ -347,7 +394,7 @@ Portal > Monitoring > Health check > Enable, Path = /health
 ----------------------------------------------------------------------
 STEP 3 - Deploy api.zip
 ----------------------------------------------------------------------
-Easiest route is the Kudu ZipDeploy UI:
+Use the Kudu ZipDeploy UI:
 
   https://<your-app-name>.scm.azurewebsites.net/ZipDeployUI
 
@@ -355,6 +402,11 @@ Easiest route is the Kudu ZipDeploy UI:
 
   Note: the archive already has dist/, node_modules/, public/ and package.json at
   its root. Do not re-zip it into a subfolder.
+
+  Do NOT use Deployment Center > "Publish files (now)". That path forces a
+  server-side Oryx build, and this package is already built - there is no src/ or
+  tsconfig.json for it to compile. ZipDeployUI honours
+  SCM_DO_BUILD_DURING_DEPLOYMENT=false from step 1 and simply extracts the files.
 
 ----------------------------------------------------------------------
 STEP 4 - Function App (worker) settings
@@ -412,7 +464,7 @@ appsettings-api.json and appsettings-worker.json contain live secrets.
 Delete the .deploy-out folder once you have pasted them.
 "@
 
-$instructions | Set-Content -LiteralPath (Join-Path $outRoot 'INSTRUCTIONS.txt') -Encoding utf8
+Write-Utf8NoBom -Path (Join-Path $outRoot 'INSTRUCTIONS.txt') -Content $instructions
 
 Write-Step 'Done'
 Write-Host "  Output: $outRoot" -ForegroundColor White
