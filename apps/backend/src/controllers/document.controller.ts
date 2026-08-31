@@ -93,6 +93,40 @@ export const uploadDocument = async (req: AuthRequest, res: Response) => {
   });
 };
 
+/**
+ * Single document by id.
+ *
+ * The detail page previously fetched the whole list and searched it client-side,
+ * which silently broke for anything past the first page.
+ */
+export const getDocumentById = async (req: AuthRequest, res: Response) => {
+  const user = req.user!;
+  const { documentId } = req.params as { documentId: string };
+
+  const document = await prisma.document.findFirst({
+    // userId in the filter, not checked afterwards, so another tenant's id
+    // returns 404 rather than leaking that the document exists.
+    where: { id: documentId, userId: user.id },
+    select: {
+      id: true,
+      title: true,
+      status: true,
+      summary: true,
+      errorMessage: true,
+      createdAt: true,
+      updatedAt: true,
+      _count: { select: { chunks: true } },
+    },
+  });
+
+  if (!document) {
+    throw new AppError(404, 'Document not found');
+  }
+
+  const { _count, ...rest } = document;
+  res.status(200).json({ document: { ...rest, chunkCount: _count.chunks } });
+};
+
 export const getUserDocuments = async (req: AuthRequest, res: Response) => {
   const user = req.user!;
 

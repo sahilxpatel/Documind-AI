@@ -1,9 +1,13 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { uploadDocument, getUserDocuments } from '../controllers/document.controller';
+import {
+  uploadDocument,
+  getUserDocuments,
+  getDocumentById,
+} from '../controllers/document.controller';
 import { validate } from '../middleware/validate.middleware';
 import { AppError } from '../middleware/error.middleware';
-import { listDocumentsSchema } from '../utils/schemas';
+import { listDocumentsSchema, documentIdParamSchema } from '../utils/schemas';
 import { config } from '../config/env';
 
 const router = Router();
@@ -29,5 +33,6 @@ const upload = multer({
 // `authenticate` is applied at the mount point in index.ts.
 router.post('/upload', upload.single('file'), uploadDocument);
 router.get('/', validate(listDocumentsSchema), getUserDocuments);
+router.get('/:documentId', validate(documentIdParamSchema), getDocumentById);
 
 export default router;

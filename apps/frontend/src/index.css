@@ -3,21 +3,102 @@
 @tailwind utilities;
 
 @layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+
   body {
-    @apply bg-slate-50 text-slate-900 font-sans antialiased selection:bg-indigo-500/30;
+    @apply bg-slate-50 text-slate-900 font-sans antialiased selection:bg-brand-500/25;
+  }
+
+  /*
+   * Visible focus rings for keyboard users only. The previous styles relied on
+   * per-element focus:ring classes, so anything without them (links, the upload
+   * dropzone, icon buttons) was impossible to navigate by keyboard.
+   */
+  :focus-visible {
+    @apply outline-none ring-2 ring-brand-500/70 ring-offset-2 ring-offset-slate-50 rounded-lg;
+  }
+
+  /* Anchors the browser's scroll-into-view below sticky headers. */
+  :target {
+    scroll-margin-top: 6rem;
+  }
+}
+
+@layer components {
+  .glass-toast {
+    @apply bg-white/80 backdrop-blur-xl border border-slate-200/60 shadow-glass rounded-2xl !important;
+  }
+
+  .glass-panel {
+    @apply bg-white/70 backdrop-blur-2xl border border-slate-200/50 shadow-glass;
+  }
+
+  /* Shared card treatment so every surface lifts the same way. */
+  .card {
+    @apply bg-white/70 backdrop-blur-xl border border-slate-200/60 shadow-card rounded-3xl;
+  }
+
+  .card-interactive {
+    @apply card transition-all duration-200 hover:shadow-card-hover hover:bg-white hover:-translate-y-0.5;
+  }
+
+  .input-field {
+    @apply block w-full px-5 py-4 bg-white/60 border border-slate-200/80 rounded-2xl shadow-sm
+           placeholder-slate-400 text-slate-800
+           transition-all hover:bg-white
+           focus:bg-white focus:border-brand-500 focus:ring-2 focus:ring-brand-500/40 focus:outline-none;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-3.5 rounded-2xl font-semibold
+           text-white bg-brand-600 shadow-lg shadow-brand-500/25
+           transition-all hover:bg-brand-700 hover:-translate-y-0.5
+           active:translate-y-0 active:scale-[0.99]
+           disabled:opacity-50 disabled:hover:translate-y-0 disabled:cursor-not-allowed;
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl font-medium
+           text-slate-600 transition-colors hover:bg-white/70 hover:text-slate-900;
+  }
+
+  /* Decorative background wash used behind most pages. */
+  .bg-orbs::before,
+  .bg-orbs::after {
+    content: '';
+    @apply absolute rounded-full blur-[120px] pointer-events-none;
+    width: 50vw;
+    height: 50vw;
+  }
+  .bg-orbs::before {
+    @apply bg-brand-200/40;
+    top: -10%;
+    right: -10%;
+  }
+  .bg-orbs::after {
+    @apply bg-purple-200/40;
+    bottom: -10%;
+    left: -10%;
   }
 }
 
 @layer utilities {
-  .glass-toast {
-    @apply bg-white/70 backdrop-blur-xl border border-slate-200/50 shadow-xl shadow-slate-200/50 rounded-2xl !important;
+  .skeleton {
+    @apply relative overflow-hidden bg-slate-200/70;
   }
-  
-  .glass-panel {
-    @apply bg-white/70 backdrop-blur-2xl border border-slate-200/50 shadow-xl shadow-slate-200/50;
+  .skeleton::after {
+    content: '';
+    @apply absolute inset-0 -translate-x-full animate-shimmer;
+    background-image: linear-gradient(
+      90deg,
+      transparent,
+      rgb(255 255 255 / 0.55),
+      transparent
+    );
   }
-  
-  /* Custom Scrollbar for a premium feel */
+
   ::-webkit-scrollbar {
     width: 6px;
     height: 6px;
@@ -26,6 +107,22 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    @apply bg-slate-200 rounded-full hover:bg-slate-300 transition-colors;
+    @apply bg-slate-300 rounded-full hover:bg-slate-400 transition-colors;
+  }
+}
+
+/*
+ * Respect the OS "reduce motion" setting. The UI leans on transitions, blurred
+ * orbs and spring animations, which can trigger nausea or migraines for people
+ * with vestibular disorders.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

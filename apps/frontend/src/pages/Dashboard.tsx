@@ -1,318 +1,424 @@
-import { useState, useEffect, useRef } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { FileText, Search as SearchIcon, Settings, LogOut, MessageSquare, Loader2, Menu, X, CloudUpload } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { useAuth } from '../context/AuthContext';
-import apiClient from '../api/client';
+import {
+  AlertCircle,
+  FileText,
+  LogOut,
+  Menu,
+  MessageSquare,
+  RefreshCw,
+  Search as SearchIcon,
+  Settings,
+  Sparkles,
+  X,
+} from 'lucide-react';
 import toast from 'react-hot-toast';
-import GlobalSearch from '../components/GlobalSearch';
 
-interface Document {
-  id: string;
-  title: string;
-  status: 'UPLOADED' | 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
-  summary: string | null;
-  createdAt: string;
-}
+import apiClient from '../api/client';
+import { useAuth } from '../context/AuthContext';
+import { useDocuments } from '../hooks/useDocuments';
+import { usePageTitle } from '../hooks/usePageTitle';
+import { apiErrorMessage, formatAbsoluteTime, formatRelativeTime } from '../lib/format';
+import type { DocumentSummary } from '../types';
+import GlobalSearch from '../components/GlobalSearch';
+import { StatusBadge } from '../components/StatusBadge';
+import { UploadDropzone } from '../components/UploadDropzone';
+import { DocumentSkeleton, EmptyState } from '../components/ui';
+
+type Tab = 'documents' | 'search' | 'settings';
+
+const TABS: { id: Tab; label: string; Icon: typeof FileText }[] = [
+  { id: 'documents', label: 'My Documents', Icon: FileText },
+  { id: 'search', label: 'Global Search', Icon: SearchIcon },
+  { id: 'settings', label: 'Settings', Icon: Settings },
+];
 
 const Dashboard = () => {
-  const [activeTab, setActiveTab] = useState('documents');
-  const { logout } = useAuth();
-  const navigate = useNavigate();
-  const [documents, setDocuments] = useState<Document[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState<Tab>('documents');
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [uploading, setUploading] = useState(false);
-  
-  // New States
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [dragActive, setDragActive] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
 
-  const fetchDocuments = async () => {
-    try {
-      const res = await apiClient.get('/api/documents');
-      setDocuments(res.data.documents);
-    } catch (error) {
-      console.error('Failed to fetch documents', error);
-    } finally {
-      setLoading(false);
-    }
-  };
+  const { logout, user } = useAuth();
+  const navigate = useNavigate();
+  const { documents, loading, error, hasPending, refresh } = useDocuments();
 
+  usePageTitle(TABS.find((t) => t.id === activeTab)?.label);
+
+  // Close the mobile drawer on Escape, which is what every other drawer does.
   useEffect(() => {
-    fetchDocuments();
-  }, []);
+    if (!mobileNavOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileNavOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [mobileNavOpen]);
 
-  const handleFile = async (file: File) => {
-    if (!file || file.type !== 'application/pdf') {
-      toast.error('Please upload a valid PDF file.');
-      return;
-    }
-
-    const formData = new FormData();
-    formData.append('file', file);
-
+  const handleUpload = async (file: File) => {
     setUploading(true);
-    const toastId = toast.loading('Uploading document...');
+    const toastId = toast.loading(`Uploading ${file.name}...`);
 
     try {
-      await apiClient.post('/api/documents/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
-      toast.success('Document uploaded successfully!', { id: toastId });
-      fetchDocuments();
-    } catch (error: any) {
-      toast.error(error.response?.data?.error || 'Upload failed', { id: toastId });
+      await apiClient.post('/api/documents/upload', (() => {
+        const form = new FormData();
+        form.append('file', file);
+        return form;
+      })(), { headers: { 'Content-Type': 'multipart/form-data' } });
+
+      // Deliberately not "uploaded successfully": the work happens afterwards in
+      // a background worker, and promising success here is why users used to
+      // wonder where their summary was.
+      toast.success('Uploaded. Processing starts in a moment.', { id: toastId });
+      await refresh();
+    } catch (err) {
+      toast.error(apiErrorMessage(err, 'Upload failed. Please try again.'), { id: toastId });
     } finally {
       setUploading(false);
     }
   };
 
-  const handleUploadClick = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) handleFile(file);
-    e.target.value = '';
-  };
-
-  const handleDrag = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.type === "dragenter" || e.type === "dragover") {
-      setDragActive(true);
-    } else if (e.type === "dragleave") {
-      setDragActive(false);
-    }
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragActive(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleFile(e.dataTransfer.files[0]);
-    }
-  };
-
-  const getStatusBadge = (status: string) => {
-    switch (status) {
-      case 'COMPLETED': return 'bg-emerald-50 text-emerald-600 border-emerald-100/50';
-      case 'FAILED': return 'bg-red-50 text-red-600 border-red-100/50';
-      case 'PROCESSING': return 'bg-indigo-50 text-indigo-600 border-indigo-100/50 animate-pulse';
-      case 'QUEUED': return 'bg-amber-50 text-amber-600 border-amber-100/50';
-      default: return 'bg-slate-50 text-slate-600 border-slate-200/50';
-    }
-  };
-
-  const SkeletonCard = () => (
-    <div className="bg-white/60 backdrop-blur-md p-6 rounded-3xl border border-slate-200/50 animate-pulse flex flex-col h-64">
-      <div className="flex justify-between items-start mb-5">
-        <div className="w-12 h-12 bg-slate-200 rounded-2xl"></div>
-        <div className="w-20 h-6 bg-slate-200 rounded-full"></div>
-      </div>
-      <div className="w-3/4 h-6 bg-slate-200 rounded mb-4"></div>
-      <div className="w-full h-4 bg-slate-200 rounded mb-2"></div>
-      <div className="w-5/6 h-4 bg-slate-200 rounded mb-6 flex-1"></div>
-      <div className="flex justify-between mt-auto pt-5 border-t border-slate-200/60">
-        <div className="w-16 h-6 bg-slate-200 rounded"></div>
-        <div className="w-24 h-6 bg-slate-200 rounded"></div>
-      </div>
-    </div>
-  );
-
   return (
-    <div className="flex h-screen bg-slate-50 text-slate-900 font-sans overflow-hidden">
-      {/* Dynamic Background */}
-      <div className="absolute inset-0 z-0 flex justify-center items-center overflow-hidden pointer-events-none">
-        <div className="absolute top-[-10%] right-[-10%] w-[50vw] h-[50vw] rounded-full bg-indigo-200/40 blur-[120px]" />
-        <div className="absolute bottom-[-10%] left-[-10%] w-[50vw] h-[50vw] rounded-full bg-purple-200/40 blur-[120px]" />
-      </div>
+    <div className="relative flex h-screen overflow-hidden bg-slate-50 text-slate-900">
+      <div className="bg-orbs pointer-events-none absolute inset-0 z-0 overflow-hidden" aria-hidden="true" />
 
-      {/* Mobile Header */}
-      <div className="md:hidden absolute top-0 left-0 w-full p-4 flex items-center justify-between z-30 bg-white/80 backdrop-blur-md border-b border-slate-200/50">
+      {/* Lets keyboard users jump past the navigation. */}
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-xl focus:bg-white focus:px-4 focus:py-2 focus:font-semibold focus:shadow-lg"
+      >
+        Skip to content
+      </a>
+
+      {/* Mobile top bar */}
+      <div className="absolute left-0 top-0 z-30 flex w-full items-center justify-between border-b border-slate-200/60 bg-white/85 p-4 backdrop-blur-md md:hidden">
         <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center">
-            <FileText className="text-white w-4 h-4" />
-          </div>
-          <span className="text-lg font-bold bg-clip-text text-transparent bg-gradient-to-r from-slate-900 to-slate-600">DocuMind</span>
+          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-tr from-brand-500 to-purple-500">
+            <FileText className="h-4 w-4 text-white" aria-hidden="true" />
+          </span>
+          <span className="text-lg font-bold">DocuMind</span>
         </div>
-        <button onClick={() => setMobileMenuOpen(!mobileMenuOpen)} className="p-2 text-slate-600">
-          {mobileMenuOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
+        <button
+          type="button"
+          onClick={() => setMobileNavOpen((open) => !open)}
+          className="rounded-lg p-2 text-slate-600"
+          aria-expanded={mobileNavOpen}
+          aria-controls="app-nav"
+          aria-label={mobileNavOpen ? 'Close menu' : 'Open menu'}
+        >
+          {mobileNavOpen ? <X className="h-6 w-6" /> : <Menu className="h-6 w-6" />}
         </button>
       </div>
 
-      {/* Sidebar - Responsive */}
-      <AnimatePresence>
-        {(mobileMenuOpen || window.innerWidth >= 768) && (
-          <motion.aside 
-            initial={{ x: -300 }}
-            animate={{ x: 0 }}
-            exit={{ x: -300 }}
-            transition={{ type: 'spring', bounce: 0, duration: 0.4 }}
-            className={`fixed md:relative top-0 left-0 h-full w-72 glass-panel border-y-0 border-l-0 flex flex-col z-40 shadow-2xl shadow-slate-200/50 ${mobileMenuOpen ? 'block' : 'hidden md:flex'}`}
+      {/*
+        Always rendered, shown/hidden with CSS.
+        The old version gated on `window.innerWidth >= 768` during render, which
+        is not reactive: resizing the window left the sidebar in the wrong state.
+      */}
+      <aside
+        id="app-nav"
+        className={`glass-panel fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-y-0 border-l-0 transition-transform duration-300 md:relative md:translate-x-0
+          ${mobileNavOpen ? 'translate-x-0' : '-translate-x-full'}`}
+      >
+        <div className="hidden items-center gap-3 border-b border-slate-200/50 p-6 md:flex">
+          <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-brand-500 to-purple-500 shadow-lg shadow-brand-500/20">
+            <FileText className="h-5 w-5 text-white" aria-hidden="true" />
+          </span>
+          <span className="text-xl font-bold">DocuMind AI</span>
+        </div>
+
+        <nav className="mt-16 flex-1 space-y-1.5 p-4 md:mt-0" aria-label="Main">
+          {TABS.map(({ id, label, Icon }) => {
+            const isActive = activeTab === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => {
+                  setActiveTab(id);
+                  setMobileNavOpen(false);
+                }}
+                // Tells assistive tech which view is showing, not just colour.
+                aria-current={isActive ? 'page' : undefined}
+                className={`flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-left transition-all ${
+                  isActive
+                    ? 'border border-slate-200/60 bg-white font-semibold text-brand-600 shadow-sm'
+                    : 'text-slate-500 hover:bg-white/60 hover:text-slate-900'
+                }`}
+              >
+                <Icon className="h-5 w-5" aria-hidden="true" />
+                {label}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="border-t border-slate-200/50 p-4">
+          {user && (
+            <div className="mb-2 flex items-center gap-3 rounded-2xl px-3 py-2.5">
+              <span
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-brand-100 text-sm font-bold text-brand-700"
+                aria-hidden="true"
+              >
+                {(user.name || user.email).charAt(0).toUpperCase()}
+              </span>
+              <span className="min-w-0">
+                <span className="block truncate text-sm font-semibold text-slate-800">
+                  {user.name || 'Signed in'}
+                </span>
+                <span className="block truncate text-xs text-slate-500">{user.email}</span>
+              </span>
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              logout();
+              navigate('/login');
+            }}
+            className="flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-slate-500 transition-all hover:bg-red-50 hover:text-red-600"
           >
-            <div className="p-6 hidden md:flex items-center gap-3 border-b border-slate-200/50">
-              <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center shadow-lg shadow-indigo-500/20">
-                <FileText className="text-white w-5 h-5" />
-              </div>
-              <span className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-slate-900 to-slate-600">DocuMind AI</span>
-            </div>
+            <LogOut className="h-5 w-5" aria-hidden="true" />
+            Sign out
+          </button>
+        </div>
+      </aside>
 
-            <nav className="flex-1 p-4 space-y-2 mt-16 md:mt-0">
-              <button 
-                onClick={() => { setActiveTab('documents'); setMobileMenuOpen(false); }}
-                className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl transition-all ${activeTab === 'documents' ? 'bg-white shadow-sm border border-slate-200/50 text-indigo-600 font-medium' : 'text-slate-500 hover:bg-white/50 hover:text-slate-900'}`}
-              >
-                <FileText className="w-5 h-5" />
-                My Documents
-              </button>
-              <button 
-                onClick={() => { setActiveTab('search'); setMobileMenuOpen(false); }}
-                className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl transition-all ${activeTab === 'search' ? 'bg-white shadow-sm border border-slate-200/50 text-indigo-600 font-medium' : 'text-slate-500 hover:bg-white/50 hover:text-slate-900'}`}
-              >
-                <SearchIcon className="w-5 h-5" />
-                Global Search
-              </button>
-              <button 
-                onClick={() => { setActiveTab('settings'); setMobileMenuOpen(false); }}
-                className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl transition-all ${activeTab === 'settings' ? 'bg-white shadow-sm border border-slate-200/50 text-indigo-600 font-medium' : 'text-slate-500 hover:bg-white/50 hover:text-slate-900'}`}
-              >
-                <Settings className="w-5 h-5" />
-                Settings
-              </button>
-            </nav>
+      {mobileNavOpen && (
+        <button
+          type="button"
+          onClick={() => setMobileNavOpen(false)}
+          className="fixed inset-0 z-30 bg-slate-900/20 backdrop-blur-sm md:hidden"
+          aria-label="Close menu"
+        />
+      )}
 
-            <div className="p-4 border-t border-slate-200/50">
-              <button 
-                onClick={() => { logout(); navigate('/login'); }}
-                className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl text-slate-500 hover:bg-red-50 hover:text-red-600 transition-all"
-              >
-                <LogOut className="w-5 h-5" />
-                Sign Out
-              </button>
-            </div>
-          </motion.aside>
-        )}
-      </AnimatePresence>
+      <main id="main-content" className="relative z-10 flex-1 overflow-y-auto pt-16 md:pt-0">
+        <div className="mx-auto max-w-6xl p-4 sm:p-8 lg:p-12">
+          {activeTab === 'search' && <GlobalSearch />}
 
-      {/* Main Content */}
-      <main className="flex-1 overflow-y-auto relative z-10 pt-16 md:pt-0">
-        <div className="max-w-6xl mx-auto p-4 sm:p-8 lg:p-12">
-          {activeTab === 'search' ? (
-            <GlobalSearch />
-          ) : (
-            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
-              <header className="mb-10 text-center sm:text-left">
-                <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-slate-900">My Documents</h1>
-                <p className="text-slate-500 mt-2 text-lg">Manage and chat with your uploaded files.</p>
+          {activeTab === 'settings' && <SettingsPanel documentCount={documents.length} />}
+
+          {activeTab === 'documents' && (
+            <div className="animate-fade-in-up">
+              <header className="mb-8 flex flex-wrap items-end justify-between gap-4">
+                <div>
+                  <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">My Documents</h1>
+                  <p className="mt-2 text-slate-500">
+                    Upload a PDF, then search it or ask questions about it.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => void refresh()}
+                  className="btn-ghost border border-slate-200/70 bg-white/60"
+                >
+                  <RefreshCw className="h-4 w-4" aria-hidden="true" />
+                  Refresh
+                </button>
               </header>
 
-              {/* Drag and Drop Zone */}
-              <div 
-                onDragEnter={handleDrag}
-                onDragLeave={handleDrag}
-                onDragOver={handleDrag}
-                onDrop={handleDrop}
-                onClick={() => inputRef.current?.click()}
-                className={`mb-12 border-2 border-dashed rounded-3xl p-10 text-center cursor-pointer transition-all ${
-                  dragActive ? 'border-indigo-500 bg-indigo-50/50 scale-[1.02]' : 'border-slate-300 bg-white/40 hover:bg-white/60 hover:border-indigo-400'
-                } ${uploading ? 'opacity-50 pointer-events-none' : ''}`}
-              >
-                <input 
-                  ref={inputRef}
-                  type="file" 
-                  accept="application/pdf" 
-                  className="hidden" 
-                  onChange={handleUploadClick}
-                  disabled={uploading}
-                />
-                <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                  {uploading ? <Loader2 className="w-8 h-8 text-indigo-600 animate-spin" /> : <CloudUpload className="w-8 h-8 text-indigo-600" />}
-                </div>
-                <h3 className="text-xl font-semibold text-slate-800 mb-1">
-                  {uploading ? 'Uploading your document...' : 'Click or drag PDF to upload'}
-                </h3>
-                <p className="text-slate-500 text-sm">Maximum file size 10MB</p>
-              </div>
+              <UploadDropzone
+                uploading={uploading}
+                onFile={handleUpload}
+                onReject={(reason) => toast.error(reason)}
+              />
 
-              {/* Document Grid */}
-              {loading ? (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {[...Array(6)].map((_, i) => <SkeletonCard key={i} />)}
-                </div>
-              ) : documents.length === 0 ? (
-                <div className="text-center py-20 text-slate-500 glass-panel rounded-3xl border border-dashed border-slate-300">
-                  <div className="w-20 h-20 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-6">
-                    <FileText className="w-10 h-10 text-indigo-400" />
-                  </div>
-                  <h3 className="text-xl font-medium text-slate-700 mb-2">No documents yet</h3>
-                  <p>Upload your first PDF to get started with AI superpowers!</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {documents.map((doc, i) => (
-                    <motion.div 
-                      key={doc.id}
-                      initial={{ opacity: 0, y: 20 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      transition={{ delay: i * 0.05 }}
-                      className="bg-white/60 backdrop-blur-md p-6 rounded-3xl shadow-sm border border-slate-200/50 hover:shadow-xl hover:shadow-slate-200/50 hover:bg-white transition-all group relative overflow-hidden flex flex-col hover:-translate-y-1"
-                    >
-                      <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 transform origin-left scale-x-0 group-hover:scale-x-100 transition-transform duration-500" />
-                      
-                      <div className="flex justify-between items-start mb-5">
-                        <div className="w-12 h-12 bg-indigo-50 rounded-2xl flex items-center justify-center text-indigo-600 flex-shrink-0 shadow-inner">
-                          <FileText className="w-6 h-6" />
-                        </div>
-                        <span className={`px-3 py-1.5 text-xs font-bold rounded-full border tracking-wide uppercase ${getStatusBadge(doc.status)}`}>
-                          {doc.status}
-                        </span>
-                      </div>
-                      
-                      <h3 className="text-xl font-bold mb-2 truncate text-slate-900 group-hover:text-indigo-600 transition-colors" title={doc.title}>
-                        {doc.title}
-                      </h3>
-                      
-                      <p className="text-sm text-slate-500 mb-6 line-clamp-2 flex-1 leading-relaxed">
-                        {doc.summary || 'Summary will appear here once processing is complete.'}
-                      </p>
-                      
-                      <div className="flex items-center justify-between border-t border-slate-200/60 pt-5 mt-auto">
-                        <span className="text-xs font-medium text-slate-400 bg-slate-100 px-2.5 py-1 rounded-md">
-                          {new Date(doc.createdAt).toLocaleDateString()}
-                        </span>
-                        
-                        <div className="flex items-center gap-3 sm:gap-4">
-                          <Link to={`/documents/${doc.id}`} className="text-slate-500 text-sm font-semibold hover:text-indigo-600 transition-colors">
-                            View
-                          </Link>
-                          <Link to={`/documents/${doc.id}/chat`} className="text-indigo-600 text-sm font-semibold flex items-center gap-1.5 hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 rounded-lg transition-colors">
-                            <MessageSquare className="w-4 h-4" /> Chat
-                          </Link>
-                        </div>
-                      </div>
-                    </motion.div>
-                  ))}
+              {/*
+                Announces background status changes. Without this, a screen reader
+                user has no idea a document finished processing.
+              */}
+              <p aria-live="polite" className="sr-only">
+                {hasPending
+                  ? 'Some documents are still processing. This list updates automatically.'
+                  : `${documents.length} documents ready.`}
+              </p>
+
+              {hasPending && (
+                <div className="mb-6 flex items-center gap-3 rounded-2xl border border-brand-200/70 bg-brand-50/70 px-4 py-3 text-sm text-brand-800">
+                  <span className="relative flex h-2.5 w-2.5 shrink-0" aria-hidden="true">
+                    <span className="absolute inline-flex h-full w-full animate-pulse-ring rounded-full bg-brand-500" />
+                    <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-brand-600" />
+                  </span>
+                  Processing in the background. This list refreshes on its own.
                 </div>
               )}
-            </motion.div>
+
+              {error && (
+                <div className="mb-6 flex items-start gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                  <span className="flex-1">{error}</span>
+                  <button type="button" onClick={() => void refresh()} className="font-semibold underline">
+                    Retry
+                  </button>
+                </div>
+              )}
+
+              {loading ? (
+                <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+                  {Array.from({ length: 6 }).map((_, i) => (
+                    <DocumentSkeleton key={i} />
+                  ))}
+                </div>
+              ) : documents.length === 0 ? (
+                <EmptyState
+                  icon={<Sparkles className="h-8 w-8" />}
+                  title="No documents yet"
+                  description="Upload your first PDF above. DocuMind will summarise it and make it searchable."
+                />
+              ) : (
+                <ul className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+                  {documents.map((doc) => (
+                    <li key={doc.id}>
+                      <DocumentCard doc={doc} />
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           )}
         </div>
       </main>
-
-      {/* Mobile Overlay */}
-      <AnimatePresence>
-        {mobileMenuOpen && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onClick={() => setMobileMenuOpen(false)}
-            className="fixed inset-0 bg-slate-900/20 backdrop-blur-sm z-30 md:hidden"
-          />
-        )}
-      </AnimatePresence>
     </div>
   );
 };
+
+function DocumentCard({ doc }: { doc: DocumentSummary }) {
+  const isReady = doc.status === 'COMPLETED';
+
+  return (
+    <article className="card-interactive group relative flex h-full flex-col overflow-hidden p-6">
+      <span
+        className="absolute left-0 top-0 h-1 w-full origin-left scale-x-0 bg-gradient-to-r from-brand-500 via-purple-500 to-pink-500 transition-transform duration-500 group-hover:scale-x-100"
+        aria-hidden="true"
+      />
+
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <span
+          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-brand-50 text-brand-600"
+          aria-hidden="true"
+        >
+          <FileText className="h-5 w-5" />
+        </span>
+        <StatusBadge status={doc.status} />
+      </div>
+
+      <h3 className="mb-2 truncate text-lg font-bold text-slate-900" title={doc.title}>
+        {doc.title}
+      </h3>
+
+      {doc.status === 'FAILED' ? (
+        // Surfaces the worker's actual reason instead of a generic apology.
+        <p className="mb-5 line-clamp-3 flex-1 text-sm leading-relaxed text-red-600">
+          {doc.errorMessage || 'Processing failed. Try uploading the file again.'}
+        </p>
+      ) : (
+        <p className="mb-5 line-clamp-3 flex-1 text-sm leading-relaxed text-slate-500">
+          {doc.summary ||
+            (isReady ? 'No summary was generated.' : 'The summary appears here once processing finishes.')}
+        </p>
+      )}
+
+      <div className="mt-auto flex items-center justify-between border-t border-slate-200/60 pt-4">
+        <time
+          className="text-xs font-medium text-slate-400"
+          dateTime={doc.createdAt}
+          title={formatAbsoluteTime(doc.createdAt)}
+        >
+          {formatRelativeTime(doc.createdAt)}
+        </time>
+
+        <div className="flex items-center gap-2">
+          <Link
+            to={`/documents/${doc.id}`}
+            className="rounded-lg px-2.5 py-1.5 text-sm font-semibold text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900"
+          >
+            View
+          </Link>
+
+          {/*
+            Chat is only meaningful once the document is indexed. Rendering a
+            disabled control with a reason beats a link that 409s.
+          */}
+          {isReady ? (
+            <Link
+              to={`/documents/${doc.id}/chat`}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-brand-50 px-3 py-1.5 text-sm font-semibold text-brand-600 transition-colors hover:bg-brand-100"
+            >
+              <MessageSquare className="h-4 w-4" aria-hidden="true" />
+              Chat
+            </Link>
+          ) : (
+            <span
+              className="inline-flex cursor-not-allowed items-center gap-1.5 rounded-lg bg-slate-100 px-3 py-1.5 text-sm font-semibold text-slate-400"
+              title={
+                doc.status === 'FAILED'
+                  ? 'Chat is unavailable because processing failed.'
+                  : 'Chat becomes available once processing finishes.'
+              }
+            >
+              <MessageSquare className="h-4 w-4" aria-hidden="true" />
+              Chat
+            </span>
+          )}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+/**
+ * The Settings tab previously rendered the documents view, because the page only
+ * branched on 'search'. It now shows something real.
+ */
+function SettingsPanel({ documentCount }: { documentCount: number }) {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  return (
+    <div className="animate-fade-in-up mx-auto max-w-2xl">
+      <header className="mb-8">
+        <h1 className="text-3xl font-bold tracking-tight">Settings</h1>
+        <p className="mt-2 text-slate-500">Your account and workspace.</p>
+      </header>
+
+      <section className="card mb-6 p-6">
+        <h2 className="mb-4 text-lg font-semibold">Account</h2>
+        <dl className="divide-y divide-slate-200/70 text-sm">
+          <div className="flex justify-between gap-4 py-3">
+            <dt className="text-slate-500">Name</dt>
+            <dd className="font-medium text-slate-800">{user?.name || 'Not set'}</dd>
+          </div>
+          <div className="flex justify-between gap-4 py-3">
+            <dt className="text-slate-500">Email</dt>
+            <dd className="truncate font-medium text-slate-800">{user?.email}</dd>
+          </div>
+          <div className="flex justify-between gap-4 py-3">
+            <dt className="text-slate-500">Documents</dt>
+            <dd className="font-medium text-slate-800">{documentCount}</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section className="card p-6">
+        <h2 className="mb-2 text-lg font-semibold">Session</h2>
+        <p className="mb-4 text-sm text-slate-500">
+          Signing out clears your access token from this browser.
+        </p>
+        <button
+          type="button"
+          onClick={() => {
+            logout();
+            navigate('/login');
+          }}
+          className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-4 py-2.5 font-semibold text-red-600 transition-colors hover:bg-red-100"
+        >
+          <LogOut className="h-4 w-4" aria-hidden="true" />
+          Sign out
+        </button>
+      </section>
+    </div>
+  );
+}
 
 export default Dashboard;

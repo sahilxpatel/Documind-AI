@@ -41,7 +41,6 @@ export default defineConfig(({ mode }) => {
           // types the object form as a ManualChunksFunction only.
           manualChunks(id: string) {
             if (!id.includes('node_modules')) return undefined;
-            if (id.includes('framer-motion')) return 'motion';
             if (id.includes('lucide-react')) return 'icons';
             if (/node_modules[\\/](react|react-dom|react-router|react-router-dom|scheduler)[\\/]/.test(id)) {
               return 'react';
