@@ -2,18 +2,22 @@
 
 Upload a PDF, and DocuMind extracts its text, summarises it, and makes it
 searchable and conversational. Ask questions in plain language and get answers
-grounded in your own documents.
+grounded in your own documents, with the source passages attached.
 
-Built on Azure as an event-driven pipeline: uploads return immediately, and the
-slow work (parsing, summarising, embedding, indexing) happens in a background
-worker.
+**Live:** https://app-documind-ai-e63j6b4twqoa2.azurewebsites.net
+
+Built on Azure as an event-driven pipeline: uploads return immediately and the
+slow work (parsing, summarising, embedding, indexing) runs in a background
+worker, while the UI tracks progress live.
 
 - **[Architecture](#architecture)** - how the pieces fit together
 - **[How it works in Azure](#how-it-works-in-azure)** - every flow, step by step
+- **[API](#api)** - endpoints and behaviour
 - **[Azure resources](#azure-resources)** - what each service does and why
 - **[Configuration](#configuration)** - where settings and secrets live
 - **[Running locally](#running-locally)**
 - **[Deploying](#deploying)**
+- **[Verifying a deployment](#verifying-a-deployment)**
 - **[Operations](#operations)** - health, failures, logs
 - **[Security](#security)**
 
@@ -24,14 +28,14 @@ worker.
 ```mermaid
 graph TB
     subgraph browser["Browser"]
-        UI["React SPA<br/><i>Vite build</i>"]
+        UI["React SPA<br/><i>polls while work is pending</i>"]
     end
 
-    subgraph appservice["Azure App Service - Linux, Node 20"]
+    subgraph appservice["Azure App Service - Linux, Node 20+"]
         API["Express API<br/><i>also serves the SPA</i>"]
     end
 
-    subgraph functionapp["Azure Function App - Linux, Node 20"]
+    subgraph functionapp["Azure Function App - Linux, Node 20+"]
         WORKER["processDocument<br/><i>Service Bus queue trigger</i>"]
     end
 
@@ -65,19 +69,25 @@ graph TB
     class SEARCH,AOAI,ACS ai
 ```
 
-### Two design decisions worth knowing
+### Three decisions worth knowing
 
 **The API also serves the web UI.** The built SPA is packaged inside the API
 deployment and served by Express from the same App Service, so one App Service
 hosts the whole application. This is not only a cost saving: because the UI and
-API share an origin, there is no CORS allow-list to maintain, and the frontend
+API share an origin there is no CORS allow-list to maintain, and the frontend
 uses relative URLs instead of having the API hostname compiled into its bundle.
 
 **Uploads are asynchronous.** The API stores the file and returns `202 Accepted`
 in well under a second. Parsing a PDF, calling a language model and indexing
 vectors can take a minute or more, which is far too long for an HTTP request. A
 Service Bus queue decouples the two, so a slow or failing document never blocks
-the API, and a burst of uploads queues up instead of overwhelming it.
+the API and a burst of uploads queues instead of overwhelming it.
+
+**The UI polls, so async work is visible.** Because processing happens after the
+response, the dashboard and document page re-check while anything is queued or
+processing. Polling pauses when the tab is hidden and resumes on return. Without
+this a card sits at *Queued* until the user reloads by hand, which reads as the
+app being broken.
 
 ---
 
@@ -114,8 +124,8 @@ Details that matter:
   `report.pdf` cannot collide.
 - **The queue message carries `messageId = documentId`,** so a retried publish is
   collapsed instead of processing the same document twice.
-- **Failures do not leave debris.** If the database insert fails, the orphaned
-  blob is deleted. If the enqueue fails, the document is marked `FAILED` with an
+- **Failures do not leave debris.** If the database insert fails the orphaned blob
+  is deleted. If the enqueue fails the document is marked `FAILED` with an
   explanatory message rather than sitting in `UPLOADED` forever with no clue why.
 
 ### Flow 2: background processing
@@ -215,6 +225,8 @@ Details that matter:
 - **The prompt is context-bounded.** The model is instructed to answer only from
   the retrieved passages and to say so plainly when the answer is not there,
   rather than inventing one.
+- **Answers carry their sources.** The passages used are returned alongside the
+  answer and shown in the UI, so a reader can check the claim against the text.
 - **Question and answer are saved in a single transaction,** so the history can
   never contain a question without its answer.
 
@@ -242,15 +254,46 @@ index can lag behind renames and deletes.
 
 ---
 
+## API
+
+All routes are JSON. Everything under `/api/documents`, `/api/chat` and
+`/api/search` requires `Authorization: Bearer <token>`.
+
+| Method | Path | Purpose |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Liveness. No dependencies touched. |
+| `GET` | `/health/ready` | Readiness. Runs `SELECT 1` and reports each integration. |
+| `POST` | `/api/auth/register` | Create an account. Returns a token. |
+| `POST` | `/api/auth/login` | Sign in. Returns a token. |
+| `GET` | `/api/auth/profile` | The current user. |
+| `POST` | `/api/documents/upload` | Multipart PDF upload. Returns `202` and queues processing. |
+| `GET` | `/api/documents` | The caller's documents, paginated (`page`, `limit`). |
+| `GET` | `/api/documents/:documentId` | One document, including `errorMessage` and `chunkCount`. |
+| `POST` | `/api/chat/:documentId` | Ask a question. Returns `answer` and `sources`. |
+| `GET` | `/api/chat/:documentId` | Conversation history. |
+| `GET` | `/api/search?q=` | Hybrid search across the caller's documents. |
+
+Conventions worth knowing:
+
+- **Errors are consistent.** `{ "error": "message" }`, with `details` carrying
+  field-level problems on a `400`. Validation failures return `400`, not `500`.
+- **Ownership is a filter, not a check.** Another user's document id returns
+  `404`, not `403`, so the API does not confirm that it exists.
+- **`409` means "not ready".** Chatting with a document that is still processing
+  is rejected with an explanation rather than an empty answer.
+- **Rate limits** are `429` with a message: 300 per 15 min overall, 20 per min on
+  the endpoints that cost money per call, 10 per 15 min on login and register.
+
+---
+
 ## Azure resources
 
-This is the deployed topology. Names follow the pattern
-`<prefix>-documind-ai-<unique>`; substitute your own.
+Names follow the pattern `<prefix>-documind-ai-<unique>`; substitute your own.
 
 | Resource | Type | Role |
 | :--- | :--- | :--- |
-| `app-documind-ai-*` | App Service (Linux, Node 20) | Runs the Express API **and** serves the React SPA |
-| `func-documind-ai-*` | Function App (Linux, Node 20) | `processDocument` worker, triggered by the queue |
+| `app-documind-ai-*` | App Service (Linux, Node 20+) | Runs the Express API **and** serves the React SPA |
+| `func-documind-ai-*` | Function App (Linux, Node 20+) | `processDocument` worker, triggered by the queue |
 | `asp-documind-ai-*` | App Service Plan (B1 Linux) | Shared compute for both of the above |
 | `sqlc-documind-ai-*` / `sqldb-*` | Azure SQL | Users, documents, chunk text, conversations, messages, notifications, audit log |
 | `st*` | Storage Account | The `documents` container holds uploaded PDFs; also backs the Functions runtime |
@@ -259,6 +302,9 @@ This is the deployed topology. Names follow the pattern
 | Azure OpenAI / AI Foundry | Cognitive Services | `gpt-4o-mini` for summaries and answers, `text-embedding-3-small` for 1536-dim vectors |
 | `comm-documind-ai-*` | Communication Services | The "your document is ready" email |
 | Application Insights + Log Analytics | Monitoring | Traces, requests, dependencies, container logs |
+
+An **Azure AI Foundry** endpoint (`*.services.ai.azure.com`) works in place of a
+classic `*.openai.azure.com` one; the SDK's Azure OpenAI route is the same.
 
 ### Why there are three data stores
 
@@ -296,6 +342,11 @@ Until this index exists, every upload fails at the indexing step and every query
 returns 404. Run `npm run search:index` once per environment;
 `npm run search:inspect` reports on the live index without changing it.
 
+Changing a field's type, its vector profile or the vector dimension cannot be
+applied in place. The script detects that and refuses unless given `--recreate`,
+because rebuilding discards every indexed chunk. Document rows and blobs are
+untouched, so re-queueing restores search.
+
 ---
 
 ## Configuration
@@ -303,20 +354,22 @@ returns 404. Run `npm run search:index` once per environment;
 ### The two arrangements
 
 **Existing resources, no Key Vault.** Settings are pushed straight from your local
-`.env` onto the App Service and Function App by `scripts/deploy-existing.ps1`.
+`.env` onto the App Service and Function App, by `scripts/deploy-existing.ps1` or
+as JSON generated by `scripts/package-for-portal.ps1`.
 
 **Greenfield, with Key Vault.** Bicep writes every secret to Key Vault, and both
 apps read them through `@Microsoft.KeyVault(SecretUri=...)` references, authorised
 by a system-assigned managed identity holding the Key Vault Secrets User role
 scoped to the vault.
 
-### Three settings that behave unusually
+### Four settings that behave unusually
 
 | Setting | Why it is special |
 | :--- | :--- |
 | `DATABASE_URL` | Prisma's `sqlserver` provider requires the JDBC-style `sqlserver://host:1433;database=...;encrypt=true` form. The ADO.NET form (`Server=tcp:...;Initial Catalog=...`) **will not parse**, and the API fails on its first query. |
 | `VITE_API_URL` | Vite inlines `VITE_*` at **build time**, so an App Service application setting cannot change an already-built bundle. Leave it empty: the API serves the SPA, so relative URLs resolve correctly on their own. |
 | `AzureWebJobsStorage` | Read by the Functions platform before app code runs. A Key Vault reference here is a known cause of "Azure Functions runtime is unreachable" on first boot, so it is set as a literal connection string. |
+| `SCM_DO_BUILD_DURING_DEPLOYMENT` | Must be `false`. Deployment packages ship compiled output and production `node_modules`; a server-side build would run `tsc` with no `tsconfig.json` and fail. |
 
 The API validates its whole environment at startup and **refuses to boot** if
 `DATABASE_URL` is missing or `JWT_SECRET` is shorter than 32 characters. There is
@@ -325,17 +378,6 @@ OpenAI and Search settings, so a half-configured deployment fails loudly instead
 of looking healthy while every feature is broken.
 
 `.env.example` documents the full list.
-
-### Verifying configuration
-
-```bash
-npm run check:env       # keys present and well-formed; API and worker agree
-npm run check:azure     # live calls to SQL, Blob, Service Bus, OpenAI, Search, ACS
-```
-
-`check:azure` makes real requests, including a small chat completion and an
-embedding, so a pass means the app will genuinely work rather than merely compile.
-Neither script ever prints keys or connection strings.
 
 ---
 
@@ -355,16 +397,21 @@ Create the config files from `.env.example`:
 Then check them, apply the schema and create the index:
 
 ```bash
-npm run check:env
+npm run check:env       # keys present and well-formed; API and worker agree
+npm run check:azure     # live calls to SQL, Blob, Service Bus, OpenAI, Search, ACS
 npm run prisma:migrate --workspace=apps/backend
 npm run search:index
 ```
+
+`check:azure` makes real requests, including a small chat completion and an
+embedding, so a pass means the app will genuinely work rather than merely compile.
+Neither script prints keys or connection strings.
 
 Azure SQL blocks unknown IPs, so add your machine:
 
 ```bash
 az sql server firewall-rule create \
-  --resource-group rg-documind-ai --server <sql-server-name> \
+  --resource-group <rg> --server <sql-server-name> \
   --name my-workstation \
   --start-ip-address "$(curl -s https://api.ipify.org)" \
   --end-ip-address "$(curl -s https://api.ipify.org)"
@@ -390,41 +437,94 @@ emulator in this setup.
 
 ## Deploying
 
-Two paths, both documented in **[DEPLOYMENT.md](./DEPLOYMENT.md)**.
+### Onto resources that already exist
 
-**Onto resources that already exist.** Creates nothing:
+Creates nothing. Two ways, depending on whether the Azure CLI is available.
+
+**With the Azure CLI** - one command, and the repeatable option:
 
 ```powershell
 az login
-./scripts/deploy-existing.ps1 -ResourceGroup rg-documind-ai -DryRun   # preview
-./scripts/deploy-existing.ps1 -ResourceGroup rg-documind-ai
+./scripts/deploy-existing.ps1 -ResourceGroup <rg> -DryRun   # preview
+./scripts/deploy-existing.ps1 -ResourceGroup <rg>
 ```
 
 It resolves the App Service and Function App from the resource group, pushes
-application settings from your local config, pins both to Node 20, packages the
+application settings from your local config, pins both to Node 20+, packages the
 API with the SPA inside it, deploys, then verifies.
 
-**A fresh environment.** Bicep in `infra/` plus the GitHub Actions pipeline in
+**Without the Azure CLI** - build the artefacts and use the Portal:
+
+```powershell
+./scripts/package-for-portal.ps1
+```
+
+That produces, in `.deploy-out/`:
+
+| File | Where it goes |
+| :--- | :--- |
+| `api.zip` | App Service (API + web UI) |
+| `worker.zip` | Function App |
+| `appsettings-api.json` | App Service > Environment variables > Advanced edit |
+| `appsettings-worker.json` | Function App > Environment variables > Advanced edit |
+| `INSTRUCTIONS.txt` | The click-by-click steps |
+
+**Apply the settings before uploading a zip.** The API validates its
+configuration at startup and exits if anything required is missing, so a zip
+deployed first just crash-loops.
+
+Upload through **Deployment Center > Manual Deployment (Push) > Publish files**.
+The Kudu `/ZipDeployUI` page does not exist on Linux App Service.
+
+`appsettings-*.json` contain live secrets. `.deploy-out/` is gitignored; delete it
+once the values are pasted.
+
+### A fresh environment
+
+Bicep in `infra/` plus the GitHub Actions pipeline in
 `.github/workflows/deploy.yml`, which runs
 `validate` -> `infrastructure` -> `build` -> `provision` -> `deploy`. See
-**[infra/README.md](./infra/README.md)**.
+**[infra/README.md](./infra/README.md)**. Full detail, including one-time OIDC
+setup, is in **[DEPLOYMENT.md](./DEPLOYMENT.md)**.
 
 ### Why deployment packages are built the way they are
 
 npm workspaces hoist dependencies to the repo root, so `apps/backend/node_modules`
-is nearly empty. Zipping the app folder would therefore ship an application with
-no dependencies at all. Instead each package is staged in its own directory and
-`npm install --omit=dev` runs *there*, followed by `prisma generate` so the client
+is nearly empty and zipping the app folder would ship an application with no
+dependencies. Each package is therefore staged in its own directory, with
+`npm install --omit=dev` run *there*, followed by `prisma generate` so the client
 lands in that tree. The Prisma schema declares Linux `binaryTargets`, so the query
 engines Azure needs are included even when the package is built on Windows.
 
-Both deployment paths verify more than "the upload succeeded":
+Packaging then removes what is only needed at build time: the Prisma engine
+download cache, the Prisma CLI, Windows engine binaries that cannot run on Linux,
+TypeScript, and all `.d.ts`, source-map and docs files. That takes `api.zip` from
+about 200 MB to 63 MB. The packaged `package.json` is also rewritten to describe a
+runtime rather than a project, so a server-side build has nothing to do instead of
+something to get wrong.
 
-- the API is polled on `/health/ready` until a real database round-trip succeeds
-- `/dashboard` is fetched to prove deep links return the SPA shell rather than 404
-- the Function App is queried for its function count, because a worker that throws
-  while loading a module reports zero functions and otherwise looks exactly like a
-  successful deploy
+---
+
+## Verifying a deployment
+
+```bash
+BASE_URL=https://<app-name>.azurewebsites.net npm run verify:live
+```
+
+Checks readiness and every dependency, exercises authenticated routes with a
+short-lived token signed from your local `JWT_SECRET`, and confirms that each
+asset the shipped HTML references is actually served. Read-only.
+
+`npm run smoke` does the same against `http://localhost:4000`.
+
+Neither creates test data: they sign a token rather than registering a user.
+
+The one thing to check by hand is the worker, because the queue being empty is
+ambiguous from outside. Upload a PDF and watch the card without reloading. The
+status should move *Queued -> Processing -> Ready* on its own. If it stays
+*Queued*, the Function App is not consuming: check that
+`func-documind-ai-*` > Overview lists `processDocument`. An empty list means the
+worker failed to load a module, which Log stream will show.
 
 ---
 
@@ -448,7 +548,8 @@ seconds to accept its first connection, so the readiness probe allows 20 seconds
 ### When a document does not process
 
 Check `Document.status` first. `FAILED` carries the reason in
-`Document.errorMessage`. Common causes:
+`Document.errorMessage`, which the UI shows on the card and the detail page.
+Common causes:
 
 - **A scanned PDF with no text layer.** Extraction does not perform OCR, and the
   worker says so explicitly.
@@ -461,7 +562,7 @@ After 5 delivery attempts a message is dead-lettered:
 
 ```bash
 az servicebus queue show \
-  --resource-group rg-documind-ai --namespace-name <namespace> \
+  --resource-group <rg> --namespace-name <namespace> \
   --name document-processing --query countDetails
 ```
 
@@ -470,23 +571,26 @@ Re-uploading is always safe, because processing is idempotent.
 ### Logs
 
 ```bash
-az webapp log tail --name <api-app-name> --resource-group rg-documind-ai
+az webapp log tail --name <api-app-name> --resource-group <rg>
 ```
 
 Both apps send traces to Application Insights. The API emits one structured JSON
 line per request with a `requestId` matching the `x-request-id` response header,
 so a user-reported failure can be traced to a specific request.
 
-### Useful commands
+### Command reference
 
 | Command | Purpose |
 | :--- | :--- |
 | `npm run check:env` | Validate local configuration |
 | `npm run check:azure` | Live connectivity to every Azure service |
-| `npm run check:migration` | Row counts, statuses, and whether a schema change is safe to apply |
+| `npm run check:migration` | Row counts, statuses, and whether a schema change is safe |
 | `npm run check:schema-drift` | Confirm the API and worker Prisma schemas match |
 | `npm run search:inspect` | Report on the live search index |
-| `npm run search:index` | Create or update the index (add `-- --recreate` to rebuild) |
+| `npm run search:index` | Create or update the index (`-- --recreate` to rebuild) |
+| `npm run verify:live` | Verify a deployed instance (needs `BASE_URL`) |
+| `npm run smoke` | Same, against localhost |
+| `npm run typecheck` / `lint` / `build` | All three workspaces |
 
 ---
 
@@ -501,10 +605,8 @@ so a user-reported failure can be traced to a specific request.
   even when the email is unknown, so response timing does not reveal which
   addresses are registered.
 - **Rate limiting** is keyed on the authenticated user, falling back to a
-  normalised IPv6 subnet for anonymous traffic: 300 requests per 15 minutes
-  overall, 20 per minute on the endpoints that cost money per call, and 10 per
-  15 minutes on login and registration. `trust proxy` is set so Azure's reverse
-  proxy does not collapse every tenant into a single bucket.
+  normalised IPv6 subnet for anonymous traffic. `trust proxy` is set so Azure's
+  reverse proxy does not collapse every tenant into a single bucket.
 - **Uploads** are restricted to PDFs of at most 10 MB, rejected before the body is
   buffered into memory.
 - **Filters are escaped.** Document ids are validated as UUIDs and OData string
@@ -518,8 +620,10 @@ so a user-reported failure can be traced to a specific request.
 
 - **Tokens live in `localStorage`,** which any injected script can read. A
   short-lived access token plus an httpOnly refresh cookie would be the next
-  hardening step. Tokens currently last 7 days with no revocation list.
+  hardening step. Tokens last 7 days with no revocation list.
 - **No OCR,** so image-only PDFs cannot be processed.
+- **No document delete.** Removing one would need to clean up the blob, the chunk
+  rows and the search documents together; the endpoint does not exist yet.
 - **SQL and Storage use public endpoints** with an `AzureServices` bypass rather
   than Private Endpoints, which would require a Premium plan and a VNet.
 - **Azure OpenAI and AI Search are accessed with API keys** rather than managed
@@ -532,10 +636,11 @@ so a user-reported failure can be traced to a specific request.
 
 ## Technology
 
-**Frontend** - React 19, Vite 8, TypeScript, Tailwind CSS, Framer Motion, Axios,
-React Router 7
+**Frontend** - React 19, Vite 8, TypeScript, Tailwind CSS, Axios, React Router 7.
+Animations and transitions are plain CSS, which keeps the bundle small and makes
+`prefers-reduced-motion` work without extra code.
 
-**Backend** - Node 20, Express 4, TypeScript, Prisma 6, Zod 4, Winston,
+**Backend** - Node 20+, Express 4, TypeScript, Prisma 6, Zod 4, Winston,
 `express-rate-limit`, Helmet
 
 **Worker** - Azure Functions v4 (Node programming model), `pdf-parse`
@@ -551,25 +656,34 @@ the greenfield path
 ```text
 documind-ai/
 ├── apps/
-│   ├── backend/           # Express API (also serves the SPA in production)
-│   │   ├── prisma/        # Canonical schema + migrations
+│   ├── backend/               # Express API (also serves the SPA in production)
+│   │   ├── prisma/            # Canonical schema + migrations
 │   │   └── src/
 │   │       ├── config/        # Startup environment validation
 │   │       ├── controllers/   # auth, document, chat, search
 │   │       ├── middleware/    # auth, validation, rate limits, errors, SPA
+│   │       ├── observability/ # Application Insights bootstrap
 │   │       ├── routes/        # Route definitions + health
 │   │       ├── services/      # Blob, Service Bus, OpenAI, Search clients
 │   │       └── utils/         # Prisma client, logger, JWT, Zod schemas
-│   ├── frontend/          # React SPA + server.mjs static host
-│   └── functions/         # processDocument worker
-│       ├── prisma/        # Drift-checked copy of the schema
+│   ├── frontend/
+│   │   ├── server.mjs         # Dependency-free static host (standalone option)
+│   │   └── src/
+│   │       ├── api/           # Axios client, token and 401 handling
+│   │       ├── components/    # StatusBadge, UploadDropzone, AuthLayout, ui
+│   │       ├── context/       # AuthContext
+│   │       ├── hooks/         # useDocuments (polling), usePageTitle
+│   │       ├── lib/           # formatting, status config, error messages
+│   │       └── pages/         # Landing, Login, Register, Dashboard, detail, chat
+│   └── functions/             # processDocument worker
+│       ├── prisma/            # Drift-checked copy of the schema
 │       └── src/
 │           ├── functions/     # Trigger registration + handler
 │           └── lib/           # Chunking, blob-name resolution
-├── infra/                 # Bicep: main.bicep, modules/, parameters/
-├── scripts/               # Index provisioning, config and connectivity checks
-├── DEPLOYMENT.md          # Deployment guide and runbook
-└── .github/workflows/     # CI/CD pipeline
+├── infra/                     # Bicep: main.bicep, modules/, parameters/
+├── scripts/                   # Packaging, deployment, and verification tooling
+├── DEPLOYMENT.md              # Deployment guide and runbook
+└── .github/workflows/         # CI/CD pipeline
 ```
 
 The worker keeps its own copy of the Prisma schema because Azure Functions

@@ -25,7 +25,9 @@
     "check:azure": "node scripts/check-azure-connectivity.mjs",
     "check:migration": "node scripts/check-migration-safety.mjs",
     "search:index": "node scripts/create-search-index.mjs",
-    "search:inspect": "node scripts/inspect-search-index.mjs"
+    "search:inspect": "node scripts/inspect-search-index.mjs",
+    "smoke": "node scripts/smoke-test-local.mjs",
+    "verify:live": "node scripts/verify-live.mjs"
   },
   "devDependencies": {
     "husky": "^9.0.11",
